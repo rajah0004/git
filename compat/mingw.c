@@ -2,6 +2,8 @@
 #include "win32.h"
 #include <conio.h>
 #include <wchar.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include "../strbuf.h"
 #include "../run-command.h"
 #include "../cache.h"
@@ -12,6 +14,19 @@
 #define HCAST(type, handle) ((type)(intptr_t)handle)
 
 static const int delay[] = { 0, 1, 10, 20, 40 };
+
+void open_in_gdb(void)
+{
+	static struct child_process cp = CHILD_PROCESS_INIT;
+	extern char *_pgmptr;
+
+	argv_array_pushl(&cp.args, "mintty", "gdb", NULL);
+	argv_array_pushf(&cp.args, "--pid=%d", getpid());
+	cp.clean_on_exit = 1;
+	if (start_command(&cp) < 0)
+		die_errno("Could not start gdb");
+	sleep(1);
+}
 
 int err_win_to_posix(DWORD winerr)
 {
@@ -929,11 +944,19 @@ unsigned int sleep (unsigned int seconds)
 char *mingw_mktemp(char *template)
 {
 	wchar_t wtemplate[MAX_PATH];
+	int offset = 0;
+
 	if (xutftowcs_path(wtemplate, template) < 0)
 		return NULL;
+
+	if (is_dir_sep(template[0]) && !is_dir_sep(template[1]) &&
+	    iswalpha(wtemplate[0]) && wtemplate[1] == L':') {
+		/* We have an absolute path missing the drive prefix */
+		offset = 2;
+	}
 	if (!_wmktemp(wtemplate))
 		return NULL;
-	if (xwcstoutf(template, wtemplate, strlen(template) + 1) < 0)
+	if (xwcstoutf(template, wtemplate + offset, strlen(template) + 1) < 0)
 		return NULL;
 	return template;
 }
@@ -1161,14 +1184,21 @@ static char *lookup_prog(const char *dir, int dirlen, const char *cmd,
 			 int isexe, int exe_only)
 {
 	char path[MAX_PATH];
+	wchar_t wpath[MAX_PATH];
 	snprintf(path, sizeof(path), "%.*s\\%s.exe", dirlen, dir, cmd);
 
-	if (!isexe && access(path, F_OK) == 0)
+	if (xutftowcs_path(wpath, path) < 0)
+		return NULL;
+
+	if (!isexe && _waccess(wpath, F_OK) == 0)
 		return xstrdup(path);
-	path[strlen(path)-4] = '\0';
-	if ((!exe_only || isexe) && access(path, F_OK) == 0)
-		if (!(GetFileAttributes(path) & FILE_ATTRIBUTE_DIRECTORY))
+	wpath[wcslen(wpath)-4] = '\0';
+	if ((!exe_only || isexe) && _waccess(wpath, F_OK) == 0) {
+		if (!(GetFileAttributesW(wpath) & FILE_ATTRIBUTE_DIRECTORY)) {
+			path[strlen(path)-4] = '\0';
 			return xstrdup(path);
+		}
+	}
 	return NULL;
 }
 
@@ -1403,6 +1433,7 @@ static pid_t mingw_spawnve_fd(const char *cmd, const char **argv, char **deltaen
 	HANDLE cons;
 	const char *(*quote_arg)(const char *arg) =
 		is_msys2_sh(*argv) ? quote_arg_msys2 : quote_arg_msvc;
+	const char *strace_env;
 
 	do_unset_environment_variables();
 
@@ -1459,6 +1490,31 @@ static pid_t mingw_spawnve_fd(const char *cmd, const char **argv, char **deltaen
 		strbuf_addstr(&args, quoted);
 		if (quoted != *argv)
 			free(quoted);
+	}
+
+	strace_env = getenv("GIT_STRACE_COMMANDS");
+	if (strace_env) {
+		char *p = path_lookup("strace.exe", 1);
+		if (!p)
+			return error("strace not found!");
+		if (xutftowcs_path(wcmd, p) < 0) {
+			free(p);
+			return -1;
+		}
+		free(p);
+		if (!strcmp("1", strace_env) ||
+		    !strcasecmp("yes", strace_env) ||
+		    !strcasecmp("true", strace_env))
+			strbuf_insert(&args, 0, "strace ", 7);
+		else {
+			const char *quoted = quote_arg(strace_env);
+			struct strbuf buf = STRBUF_INIT;
+			strbuf_addf(&buf, "strace -o %s ", quoted);
+			if (quoted != strace_env)
+				free((char *)quoted);
+			strbuf_insert(&args, 0, buf.buf, buf.len);
+			strbuf_release(&buf);
+		}
 	}
 
 	ALLOC_ARRAY(wargs, st_add(st_mult(2, args.len), 1));
@@ -1663,6 +1719,8 @@ char *mingw_getenv(const char *name)
 	if (!w_key)
 		die("Out of memory, (tried to allocate %u wchar_t's)", len_key);
 	xutftowcs(w_key, name, len_key);
+	/* GetEnvironmentVariableW() only sets the last error upon failure */
+	SetLastError(ERROR_SUCCESS);
 	len_value = GetEnvironmentVariableW(w_key, w_value, ARRAY_SIZE(w_value));
 	if (!len_value && GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
 		free(w_key);
@@ -2479,6 +2537,7 @@ int wmain(int argc, const wchar_t **wargv)
 #endif
 
 	maybe_redirect_std_handles();
+	fsync_object_files = 1;
 
 	/* determine size of argv and environ conversion buffer */
 	maxlen = wcslen(wargv[0]);
@@ -2540,4 +2599,129 @@ int uname(struct utsname *buf)
 	xsnprintf(buf->version, sizeof(buf->version),
 		  "%u", (v >> 16) & 0x7fff);
 	return 0;
+}
+
+/*
+ * Determines whether the SID refers to an administrator or the current user.
+ *
+ * For convenience, the `info` parameter allows avoiding multiple calls to
+ * `OpenProcessToken()` if this function is called more than once. The initial
+ * value of `*info` is expected to be `NULL`, and it needs to be released via
+ * `free()` after the last call to this function.
+ *
+ * Returns 0 if the SID indicates a dubious owner of system files, otherwise 1.
+ */
+static int is_valid_system_file_owner(PSID sid, TOKEN_USER **info)
+{
+	HANDLE token;
+	DWORD len;
+
+	if (IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
+	    IsWellKnownSid(sid, WinLocalSystemSid))
+		return 1;
+
+	/* Obtain current user's SID */
+	if (!*info &&
+	    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+		if (!GetTokenInformation(token, TokenUser, NULL, 0, &len)) {
+			*info = xmalloc((size_t)len);
+			if (!GetTokenInformation(token, TokenUser, *info, len,
+						 &len))
+				FREE_AND_NULL(*info);
+		}
+		CloseHandle(token);
+	}
+
+	return *info && EqualSid(sid, (*info)->User.Sid) ? 1 : 0;
+}
+
+/*
+ * Verify that the file in question is owned by an administrator or system
+ * account, or at least by the current user.
+ *
+ * This function returns 1 if successful, 0 if the file is not owned by any of
+ * these, or -1 on error.
+ */
+static int validate_system_file_ownership(const char *path)
+{
+	WCHAR wpath[MAX_PATH];
+	PSID owner_sid = NULL, problem_sid = NULL;
+	PSECURITY_DESCRIPTOR descriptor = NULL;
+	TOKEN_USER* info = NULL;
+	DWORD err;
+	int ret;
+
+	if (xutftowcs_path(wpath, path) < 0)
+		return -1;
+
+	err = GetNamedSecurityInfoW(wpath, SE_FILE_OBJECT,
+				    OWNER_SECURITY_INFORMATION |
+				    DACL_SECURITY_INFORMATION,
+				    &owner_sid, NULL, NULL, NULL, &descriptor);
+
+	/* if the file does not exist, it does not have a valid owner */
+	if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+		ret = 0;
+	else if (err != ERROR_SUCCESS)
+		ret = error(_("failed to validate '%s' (%ld)"), path, err);
+	else if (!IsValidSid(owner_sid))
+		ret = error(_("invalid owner: '%s'"), path);
+	else if (is_valid_system_file_owner(owner_sid, &info))
+		ret = 1;
+	else {
+		ret = 0;
+		problem_sid = owner_sid;
+	}
+
+	if (!ret && problem_sid) {
+#define MAX_NAME_OR_DOMAIN 256
+		wchar_t name[MAX_NAME_OR_DOMAIN];
+		wchar_t domain[MAX_NAME_OR_DOMAIN];
+		wchar_t *p = NULL;
+		DWORD size = MAX_NAME_OR_DOMAIN;
+		SID_NAME_USE type;
+		char utf[3 * MAX_NAME_OR_DOMAIN + 1];
+
+		if (!LookupAccountSidW(NULL, problem_sid, name, &size,
+				       domain, &size, &type) ||
+		    xwcstoutf(utf, name, ARRAY_SIZE(utf)) < 0) {
+			if (!ConvertSidToStringSidW(problem_sid, &p))
+				strlcpy(utf, "(unknown)", ARRAY_SIZE(utf));
+			else {
+				if (xwcstoutf(utf, p, ARRAY_SIZE(utf)) < 0)
+					strlcpy(utf, "(some user)",
+						ARRAY_SIZE(utf));
+				LocalFree(p);
+			}
+		}
+
+		warning(_("'%s' has a dubious owner: '%s'.\n"
+			  "For security reasons, it is therefore ignored.\n"
+			  "To fix this, please transfer ownership to an "
+			  "admininstrator."),
+			path, utf);
+	}
+
+	if (descriptor)
+		LocalFree(descriptor);
+	free(info);
+
+	return ret;
+}
+
+const char *program_data_config(void)
+{
+	static struct strbuf path = STRBUF_INIT;
+	static unsigned initialized;
+
+	if (!initialized) {
+		const char *env = mingw_getenv("PROGRAMDATA");
+		if (env) {
+			strbuf_addf(&path, "%s/Git/config", env);
+			if (validate_system_file_ownership(path.buf) != 1)
+				strbuf_setlen(&path, 0);
+		}
+		initialized = 1;
+	}
+	return *path.buf ? path.buf : NULL;
 }
