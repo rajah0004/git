@@ -1541,6 +1541,7 @@ soft_increment:
 		strbuf_reset(&s->buf);
 		reassemble_patch(s, file_diff, 0, &s->buf);
 
+		discard_index(s->s.r->index);
 		if (s->mode->apply_for_checkout)
 			apply_for_checkout(s, &s->buf,
 					   s->mode->is_reverse);
@@ -1551,7 +1552,9 @@ soft_increment:
 					 NULL, 0, NULL, 0))
 				error(_("'git apply' failed"));
 		}
-		repo_refresh_and_write_index(s->s.r, REFRESH_QUIET, 0);
+		if (!repo_read_index(s->s.r))
+			repo_refresh_and_write_index(s->s.r, REFRESH_QUIET, 0,
+						     1, NULL, NULL, NULL);
 	}
 
 	putchar('\n');
@@ -1594,7 +1597,9 @@ int run_add_p(struct repository *r, enum add_p_mode mode,
 		s.mode = &patch_mode_stage;
 	s.revision = revision;
 
-	if (repo_refresh_and_write_index(r, REFRESH_QUIET, 0) < 0 ||
+	if (discard_index(r->index) < 0 || repo_read_index(r) < 0 ||
+	    repo_refresh_and_write_index(r, REFRESH_QUIET, 0, 1,
+					 NULL, NULL, NULL) < 0 ||
 	    parse_diff(&s, ps) < 0) {
 		strbuf_release(&s.plain);
 		strbuf_release(&s.colored);
