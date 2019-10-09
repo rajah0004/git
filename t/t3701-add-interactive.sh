@@ -4,7 +4,7 @@ test_description='add -i basic tests'
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-terminal.sh
 
-if ! test_have_prereq PERL
+if test true != "$GIT_TEST_ADD_I_USE_BUILTIN" && ! test_have_prereq PERL
 then
 	skip_all='skipping add -i tests, perl not available'
 	test_done
