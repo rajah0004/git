@@ -21,7 +21,8 @@ KNOWN_FAILURE_CHERRY_PICK_SEES_EMPTY_COMMIT=1
 KNOWN_FAILURE_NOFF_MERGE_DOESNT_CREATE_EMPTY_SUBMODULE_DIR=1
 test_submodule_switch "git_stash"
 
-setup_basic() {
+setup_basic () {
+	test_when_finished "rm -rf main sub" &&
 	git init sub &&
 	(
 		cd sub &&
@@ -32,8 +33,7 @@ setup_basic() {
 		cd main &&
 		git submodule add ../sub &&
 		test_commit main_file
-	) &&
-	test_when_finished "rm -rf main sub"
+	)
 }
 
 test_expect_success 'stash push with submodule.recurse=true preserves dirty submodule worktree' '
